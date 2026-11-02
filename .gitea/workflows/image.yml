@@ -1,0 +1,99 @@
+name: image
+
+# An r<n>-<upstream sha7> tag publishes 10.10.1.10:3009/snuffomega/lidarr-metadata-provider:<tag>
+# to Gitea's registry. r<n> is the fork release and only ever goes up, so
+# Renovate can order the tags; the suffix is the upstream commit the fork is on.
+# This directory existing means Gitea ignores .github/workflows, which publish
+# to ghcr and build datasets for upstream.
+on:
+  push:
+    tags: ['r*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing r<n>-<sha7> tag to publish
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ gitea.workflow }}-${{ gitea.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TAG: ${{ inputs.tag || gitea.ref_name }}
+      REPO: snuffomega/lidarr-metadata-provider
+      REGISTRY: 10.10.1.10:3009
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ inputs.tag || gitea.ref_name }}
+          fetch-depth: 0
+
+      - name: Check the tag
+        run: |
+          [[ "$TAG" =~ ^r[0-9]+-([0-9a-f]{7})$ ]] || { echo "FAIL: tag '$TAG' is not r<n>-<sha7>" >&2; exit 1; }
+          base="${BASH_REMATCH[1]}"
+          git merge-base --is-ancestor "$base" HEAD || { echo "FAIL: $base is not an ancestor of $TAG" >&2; exit 1; }
+          echo "IMAGE=$REGISTRY/$REPO:$TAG" >> "$GITHUB_ENV"
+
+      - name: Refuse to overwrite a published tag
+        run: |
+          token=$(curl -sS --fail "http://$REGISTRY/v2/token?scope=repository:$REPO:pull&service=container_registry" | jq -r .token)
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "http://$REGISTRY/v2/$REPO/manifests/$TAG")
+          case "$code" in
+            404) ;;
+            200) echo "FAIL: $IMAGE is already published; version tags are immutable" >&2; exit 1 ;;
+            *) echo "FAIL: registry answered $code for $IMAGE" >&2; exit 1 ;;
+          esac
+
+      - name: Vet and test
+        run: |
+          printf 'FROM golang:1.26-alpine\nWORKDIR /src\nCOPY . .\nRUN go vet ./... && go test -count=1 ./...\n' \
+            | docker build --pull -f - .
+
+      - name: Build the image
+        run: |
+          docker build --pull --build-arg VERSION="$TAG" \
+            --label org.opencontainers.image.source="${{ gitea.server_url }}/$REPO" \
+            --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+            --label org.opencontainers.image.version="$TAG" \
+            -t "$IMAGE" .
+
+      - name: Smoke-check the image
+        run: |
+          health=$(docker image inspect "$IMAGE" --format '{{json .Config.Healthcheck.Test}}')
+          echo "Healthcheck: $health"
+          case "$health" in *'/healthz'*) ;; *) echo "FAIL: image healthcheck does not probe /healthz" >&2; exit 1 ;; esac
+          [ "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = lidarr ] || { echo "FAIL: image does not run as lidarr" >&2; exit 1; }
+
+      - name: Push the image to the registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$REGISTRY_TOKEN" ]; then
+            echo "FAIL: the REGISTRY_TOKEN secret is not set, so $IMAGE is not published" >&2
+            exit 1
+          fi
+          DOCKER_CONFIG="$(mktemp -d)"
+          export DOCKER_CONFIG
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u snuffomega --password-stdin
+          docker push "$IMAGE"
+          echo "Published $(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')"
+
+      - name: Remove the local image
+        if: always()
+        run: docker image rm -f "$IMAGE" || true
